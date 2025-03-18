@@ -74,7 +74,7 @@ def split_pdf_by_chapter(pdf_path: str, config) -> list:
     """
     doc = fitz.open(pdf_path)
     os.makedirs(config.chapters_dir, exist_ok=True)
-    
+
     chapter_overview_pages = []
     for page_index in range(doc.page_count):
         text = doc.load_page(page_index).get_text("text")

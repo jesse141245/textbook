@@ -3,3 +3,5 @@ node_modules
 alg
 .venv
 alg.pdf
+alg1.pdf
+textbook2json/__pycache__

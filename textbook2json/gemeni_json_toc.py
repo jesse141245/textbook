@@ -7,21 +7,21 @@ import argparse
 import requests
 import os
 import logging
-import fitz  
+import fitz
+import copy
 from concurrent.futures import ThreadPoolExecutor
 from json_repair import repair_json
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+from rewrite import Config as RewriteConfig, run_rewrite
+
 
 # --------------------------------------------------------------------
 # Helper Function
 # --------------------------------------------------------------------
 def sanitize_filename(name: str) -> str:
-    """
-    Replaces characters that are invalid in Windows filenames with an underscore.
-    Invalid characters: <>:"/\\|?*
-    """
+    """Replaces invalid filename characters with underscores."""
     return re.sub(r'[<>:"/\\|?*]', '_', name)
 
 # --------------------------------------------------------------------
@@ -31,12 +31,12 @@ class Config:
     def __init__(self, args):
         self.api_key = args.api_key or os.getenv("GEMINI_API_KEY", "")
         if not self.api_key:
-            raise ValueError("Must provide a valid Gemini API key via --api-key or GEMINI_API_KEY env var.")
+            raise ValueError("Must provide a valid Gemini API key.")
         self.model_name = args.model_name
-        self.output_file = args.output_file  
+        self.output_file = args.output_file  # Still not used for main output
         self.chapters_dir = args.pdf_file.replace(".pdf", "")
-        self.max_retries = args.max_retries  
-        
+        self.max_retries = args.max_retries
+        self.prompt = """You are an expert educator and content extractor...""" # (Your prompt remains the same)
         self.prompt = """You are an expert educator and content extractor. Your task is to extract 
 as many detailed and useful educational question-answer pairs and instructional notes as possible 
 from the text chunk below. Please follow these steps carefully:
@@ -61,139 +61,133 @@ JSON output:
 """
 
 # --------------------------------------------------------------------
-# PDF Splitting using the TOC only
+# PDF Splitting
 # --------------------------------------------------------------------
 def split_pdf_by_chapter(pdf_path: str, config) -> list:
-    """
-    Splits the PDF using the TOC entries.
-    Returns a list of tuples: ((chapter_title, subchapter_title), output_pdf_path)
-    where subchapter_title is None if not applicable.
-    """
-    doc = fitz.open(pdf_path)
-    os.makedirs(config.chapters_dir, exist_ok=True)
-    
-    toc = doc.get_toc()
-    if not toc:
-        logging.warning("No TOC found in PDF.")
-        return []
-    
-    skip_keywords = ["answer key", "glossary", "index", "preface"]
-    
-    processed_chapters = []
-    current_chapter = None
-    for entry in toc:
-        level, title, page = entry
-        page_idx = page - 1 
-        
-        if level == 1:
-            if any(kw in title.lower() for kw in skip_keywords):
-                logging.info(f"Skipping chapter '{title}' (page {page}) due to skip keywords.")
-                current_chapter = None
-                continue
-            current_chapter = {"title": title, "page": page_idx, "subchapters": []}
-            processed_chapters.append(current_chapter)
-        elif level >= 2:
-            if current_chapter is None:
-                continue
-            current_chapter["subchapters"].append({"title": title, "page": page_idx})
-    
-    results = []
-    for i, chapter in enumerate(processed_chapters):
-        chapter_title = chapter["title"]
-        chapter_start = chapter["page"]
-        if i + 1 < len(processed_chapters):
-            chapter_end = processed_chapters[i + 1]["page"]
-        else:
-            chapter_end = doc.page_count
+        # (Your existing split_pdf_by_chapter function - No Changes)
+        doc = fitz.open(pdf_path)
+        os.makedirs(config.chapters_dir, exist_ok=True)
 
-        if chapter_end <= chapter_start:
-            logging.warning(f"Chapter '{chapter_title}' has no pages (start: {chapter_start+1}, end: {chapter_end+1}); skipping.")
-            continue
+        toc = doc.get_toc()
+        if not toc:
+            logging.warning("No TOC found in PDF.")
+            return []
 
-        if chapter["subchapters"]:
-            subs = chapter["subchapters"]
-            for j, sub in enumerate(subs):
-                sub_title = sub["title"]
-                sub_start = sub["page"]
-                if j + 1 < len(subs):
-                    sub_end = subs[j + 1]["page"]
-                else:
-                    sub_end = chapter_end
+        skip_keywords = ["answer key", "glossary", "index", "preface", "blank_page", "blank", "appendix", "acknowledgment", 'contents', 'table of contents']
 
-                if sub_end <= sub_start:
-                    logging.warning(f"Subchapter '{sub_title}' of chapter '{chapter_title}' has no pages (start: {sub_start+1}, end: {sub_end+1}); skipping.")
+        processed_chapters = []
+        current_chapter = None
+        for entry in toc:
+            level, title, page = entry
+            page_idx = page - 1
+
+            if level == 1:
+                if any(kw in title.lower() for kw in skip_keywords):
+                    logging.info(f"Skipping chapter '{title}' (page {page}) due to skip keywords.")
+                    current_chapter = None
                     continue
+                current_chapter = {"title": title, "page": page_idx, "subchapters": []}
+                processed_chapters.append(current_chapter)
+            elif level >= 2:
+                if current_chapter is None:
+                    continue
+                current_chapter["subchapters"].append({"title": title, "page": page_idx})
 
+        results = []
+        for i, chapter in enumerate(processed_chapters):
+            chapter_title = chapter["title"]
+            chapter_start = chapter["page"]
+            if i + 1 < len(processed_chapters):
+                chapter_end = processed_chapters[i + 1]["page"]
+            else:
+                chapter_end = doc.page_count
+
+            if chapter_end <= chapter_start:
+                logging.warning(f"Chapter '{chapter_title}' has no pages (start: {chapter_start+1}, end: {chapter_end+1}); skipping.")
+                continue
+
+            if chapter["subchapters"]:
+                subs = chapter["subchapters"]
+                for j, sub in enumerate(subs):
+                    sub_title = sub["title"]
+                    sub_start = sub["page"]
+                    if j + 1 < len(subs):
+                        sub_end = subs[j + 1]["page"]
+                    else:
+                        sub_end = chapter_end
+
+                    if sub_end <= sub_start:
+                        logging.warning(f"Subchapter '{sub_title}' of chapter '{chapter_title}' has no pages (start: {sub_start+1}, end: {sub_end+1}); skipping.")
+                        continue
+
+                    sub_doc = fitz.open()
+                    for p in range(sub_start, sub_end):
+                        sub_doc.insert_pdf(doc, from_page=p, to_page=p)
+
+                    safe_chapter = sanitize_filename(chapter_title.replace(" ", "_"))
+                    safe_sub = sanitize_filename(sub_title.replace(" ", "_"))
+                    filename = f"{safe_chapter}_{safe_sub}.pdf"
+                    output_path = os.path.join(config.chapters_dir, filename)
+
+                    sub_doc.save(output_path)
+                    logging.info(f"Saved subchapter '{sub_title}' of chapter '{chapter_title}' (pages {sub_start+1}-{sub_end}) to {filename}")
+                    results.append(((chapter_title, sub_title), output_path))
+            else:
                 sub_doc = fitz.open()
-                for p in range(sub_start, sub_end):
+                for p in range(chapter_start, chapter_end):
                     sub_doc.insert_pdf(doc, from_page=p, to_page=p)
-                
                 safe_chapter = sanitize_filename(chapter_title.replace(" ", "_"))
-                safe_sub = sanitize_filename(sub_title.replace(" ", "_"))
-                filename = f"{safe_chapter}_{safe_sub}.pdf"
+                filename = f"{safe_chapter}.pdf"
                 output_path = os.path.join(config.chapters_dir, filename)
-                
-                sub_doc.save(output_path)
-                logging.info(f"Saved subchapter '{sub_title}' of chapter '{chapter_title}' (pages {sub_start+1}-{sub_end}) to {filename}")
-                results.append(((chapter_title, sub_title), output_path))
-        else:
-            sub_doc = fitz.open()
-            for p in range(chapter_start, chapter_end):
-                sub_doc.insert_pdf(doc, from_page=p, to_page=p)
-            safe_chapter = sanitize_filename(chapter_title.replace(" ", "_"))
-            filename = f"{safe_chapter}.pdf"
-            output_path = os.path.join(config.chapters_dir, filename)
-            
-            sub_doc.save(output_path)
-            logging.info(f"Saved chapter '{chapter_title}' (pages {chapter_start+1}-{chapter_end}) to {filename}")
-            results.append(((chapter_title, None), output_path))
-    
-    return results
 
+                sub_doc.save(output_path)
+                logging.info(f"Saved chapter '{chapter_title}' (pages {chapter_start+1}-{chapter_end}) to {filename}")
+                results.append(((chapter_title, None), output_path))
+
+        return results
 # --------------------------------------------------------------------
 # Pipeline
 # --------------------------------------------------------------------
+
 class PDFPipeline:
     def __init__(self, config: Config):
         self.config = config
-        genai.Client(api_key=self.config.api_key)
         if os.path.exists(self.config.output_file):
             os.remove(self.config.output_file)
+        # Correctly initialize the client:
         self.client = genai.Client(api_key=self.config.api_key)
 
-    def clean_response(self, response_text: str):
-        invalid_ctrl_pattern = r'[\x00-\x08\x0B\x0C\x0E-\x1F]'
-        cleaned_text = re.sub(invalid_ctrl_pattern, '', response_text)
-        return cleaned_text
 
     def _write_single_line(self, content: str, output_file: str):
-        """Atomic write for individual JSON lines into the given output_file."""
+        """Atomic write for individual JSON lines."""
         with open(output_file, "a", encoding="utf-8") as f:
             f.write(content + "\n")
 
-    def process_pdf(self, pdf_path: str):
-        chapters = split_pdf_by_chapter(pdf_path, self.config)
-        logging.info(f"Total {len(chapters)} chapter/subchapter PDF(s) created in '{self.config.chapters_dir}' directory.")
 
-        # Process chapters in parallel (batching up to 4 at a time).
-        for i in range(0, len(chapters), 4):
-            pair = chapters[i:i+4]
-            with ThreadPoolExecutor(max_workers=4) as executor:
-                futures = {
-                    executor.submit(self._call_llm, chapter_pdf_path, chapter_index): (chapter_index, chapter_pdf_path)
-                    for chapter_index, chapter_pdf_path in pair
-                }
-                for future in futures:
-                    chapter_index, chapter_pdf_path = futures[future]
-                    try:
-                        response_text = future.result()
-                        self._write_jsonl_record(chapter_index, chapter_pdf_path, response_text)
-                    except Exception as e:
-                        logging.error(f"Error processing chapter {chapter_index}: {e}")
+    def process_pdf(self, pdf_path: str):
+            chapters = split_pdf_by_chapter(pdf_path, self.config)
+            logging.info(f"Total {len(chapters)} chapter/subchapter PDF(s) created.")
+
+            for i in range(0, len(chapters), 4):  # Process in batches of 4
+                batch = chapters[i:i+4]
+                with ThreadPoolExecutor(max_workers=4) as executor:
+                    futures = {
+                        executor.submit(self._call_llm, chapter_pdf_path, chapter_index): (chapter_index, chapter_pdf_path)
+                        for chapter_index, chapter_pdf_path in batch
+                    }
+                    for future in futures:
+                        chapter_index, chapter_pdf_path = futures[future]
+                        try:
+                            response_text = future.result()
+                            self._write_jsonl_record(chapter_index, chapter_pdf_path, response_text)
+                        except Exception as e:
+                            logging.error(f"Error processing {chapter_index}: {e}")
+
 
     def _call_llm(self, chapter_pdf_path: str, chapter_index: tuple) -> str:
         with open(chapter_pdf_path, "rb") as f:
             chapter_bytes = f.read()
+
         attempt = 0
         while attempt < self.config.max_retries:
             attempt += 1
@@ -203,88 +197,124 @@ class PDFPipeline:
                     model=self._fix_model_name(),
                     contents=[chapter_part, self.config.prompt]
                 )
-                if response.text is None:
+                if response.text is None:  # Check if .text is None
                     raise Exception("LLM response.text is None.")
-                tokens_used = (response.usage_metadata.candidates_token_count or 0) + (response.usage_metadata.total_token_count or 0)
-                logging.info(f"Chapter {chapter_index}: {tokens_used} tokens")
+
+                # Log token usage (important for cost tracking)
+                tokens_used = (response.candidates[0].token_count if response.candidates else 0)
+                logging.info(f"Chapter {chapter_index}: {tokens_used} tokens used")
                 return response.text
+
             except Exception as e:
-                logging.warning(f"LLM call failed for chapter {chapter_index}, attempt {attempt}/{self.config.max_retries}: {e}")
-                time.sleep(2 ** attempt)
-        logging.error(f"Giving up on chapter {chapter_index} after {self.config.max_retries} retries.")
-        return ""
+                logging.warning(f"LLM call failed for {chapter_index}, attempt {attempt}/{self.config.max_retries}: {e}")
+                time.sleep(2 ** attempt)  # Exponential backoff
+
+        logging.error(f"Giving up on {chapter_index} after {self.config.max_retries} retries.")
+        return ""  # Return empty string on failure
+
 
     def parse_json(self, response_text: str) -> dict:
+        """
+        Parses the LLM response text, attempting to extract a valid JSON object.
+        Handles various common issues, including extra text, invalid characters,
+        and incorrect delimiters.  Returns a dictionary on success, or raises
+        a *detailed* exception on failure.
+        """
         if response_text is None:
             raise ValueError("Response text is None.")
+
+        # 1. Remove common LLM prefixes/suffixes (like ```json ... ```)
         cleaned = response_text.replace('```json', '').replace('```', '').strip()
-        cleaned = re.sub(r'[\x00-\x08\x0B-\x0C\x0E-\x1F]', '', cleaned)
+
+        # 2. Remove invalid control characters.
+        cleaned = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F]', '', cleaned)
+
+        # 3. Try to find the *first* '{' and the *last* '}' to handle extra text.
         json_start = cleaned.find('{')
-        json_end = cleaned.rfind('}') + 1
-        if json_start != -1 and json_end != 0:
-            cleaned = cleaned[json_start:json_end]
-        cleaned = re.sub(r'}\s*{', r'},{', cleaned)
-        cleaned = re.sub(r',(\s*[}\]])', r'\1', cleaned)
-        repaired = repair_json(cleaned)
+        json_end = cleaned.rfind('}') + 1  # +1 to *include* the last '}'
+
+        if json_start == -1 or json_end == 0:
+            raise ValueError(f"No valid JSON object found in response.  First 200 chars: {cleaned[:200]}")
+        cleaned = cleaned[json_start:json_end]
+
+        # 4. Try to fix common JSON errors (like missing commas between objects).
+        cleaned = re.sub(r'}\s*{', r'},{', cleaned)  # Add commas between adjacent objects
+        cleaned = re.sub(r',(\s*[}\]])', r'\1', cleaned) # Remove trailing commas
+
+        # 5. Use json_repair to handle more complex errors.
+        try:
+            repaired = repair_json(cleaned)
+        except Exception as e:
+            raise ValueError(f"json_repair failed: {e}.  Original (cleaned) text (first 200 chars): {cleaned[:200]}")
+
+        # 6. Attempt to parse as JSON.
         try:
             return json.loads(repaired)
-        except Exception as e:
-            raise Exception(f"Failed to parse JSON after repair: {e}\nRepaired JSON (first 300 chars): {repaired[:300]}")
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Failed to parse JSON after repair: {e}\nRepaired JSON (first 300 chars): {repaired[:300]}\nOriginal (cleaned) text (first 300 chars): {cleaned[:300]}")
 
     def _write_jsonl_record(self, chunk_index: tuple, chunk_pdf_path: str, response_text: str):
-        """
-        Writes JSON lines into a chapter-specific folder.
-        `chunk_index` is a tuple: (chapter_title, subchapter_title)
-        """
-        chapter_title = chunk_index[0] if isinstance(chunk_index, tuple) else chunk_index
+        chapter_title, subchapter_title = chunk_index
         safe_chapter = sanitize_filename(chapter_title.replace(" ", "_"))
-        chapter_folder = os.path.join(self.config.chapters_dir, safe_chapter)
+
+        chapter_folder = os.path.join(self.config.chapters_dir, 'jsonl')
         os.makedirs(chapter_folder, exist_ok=True)
         
-        if isinstance(chunk_index, tuple) and len(chunk_index) > 1 and chunk_index[1]:
-            safe_sub = sanitize_filename(chunk_index[1].replace(" ", "_"))
-            output_file = os.path.join(chapter_folder, f"{safe_sub}.jsonl")
+        if subchapter_title:
+            safe_sub = sanitize_filename(subchapter_title.replace(" ", "_"))
+            filename = f"{safe_chapter}_{safe_sub}.jsonl"
         else:
-            output_file = os.path.join(chapter_folder, f"{safe_chapter}.jsonl")
+            filename = f"{safe_chapter}.jsonl"
+        
+        output_file = os.path.join(chapter_folder, filename)
         
         try:
-            response_data = self.parse_json(response_text)
+            response_data = self.parse_json(response_text) #parse the json
+
+            # Handle a list of JSON objects
             if isinstance(response_data, list):
                 combined = {"qa_pairs": [], "instructional_notes": []}
-                for item in response_data:
+                for item in response_data: #combine each dict
                     if isinstance(item, dict):
-                        if "qa_pairs" in item and isinstance(item["qa_pairs"], list):
-                            combined["qa_pairs"].extend(item["qa_pairs"])
-                        if "instructional_notes" in item and isinstance(item["instructional_notes"], list):
-                            combined["instructional_notes"].extend(item["instructional_notes"])
-                response_data = combined
-            if not isinstance(response_data, dict):
-                raise Exception("Parsed JSON is not a dictionary.")
+                        combined["qa_pairs"].extend(item.get("qa_pairs", []))
+                        combined["instructional_notes"].extend(item.get("instructional_notes", []))
+                response_data = combined  # Use the combined dictionary
+
+            # Check if response is dict with expected structure
+            if not isinstance(response_data, dict) or not all(k in response_data for k in ["qa_pairs", "instructional_notes"]):
+                raise ValueError(f"Parsed JSON is not a dictionary or missing keys: {response_data.keys() if isinstance(response_data, dict) else 'Not a dict'}")
             
+            # Write QA pairs.
             for qa in response_data.get("qa_pairs", []):
-                if not isinstance(qa, dict):
+                if not isinstance(qa, dict) or "question" not in qa or "answer" not in qa:
+                    logging.warning(f"Skipping invalid QA pair: {qa}")
                     continue
+
                 entry = {
                     "instruction": qa.get("question", "").strip(),
                     "input": "",
                     "output": qa.get("answer", "").strip(),
                     "metadata": {
                         "chapter": chapter_title,
-                        "subchapter": chunk_index[1] if (isinstance(chunk_index, tuple) and len(chunk_index) > 1) else None,
+                        "subchapter": subchapter_title,
                         "source": chunk_pdf_path,
                         "type": "qa"
                     }
                 }
                 self._write_single_line(json.dumps(entry, ensure_ascii=False), output_file)
             
+            # Write instructional notes.
             for note_idx, note in enumerate(response_data.get("instructional_notes", [])):
+                if not isinstance(note, str):
+                    logging.warning(f"Skipping invalid instructional note (not a string): {note}")
+                    continue
                 entry = {
                     "instruction": note.strip(),
                     "input": "",
-                    "output": "",
+                    "output": "",  # No output for notes
                     "metadata": {
                         "chapter": chapter_title,
-                        "subchapter": chunk_index[1] if (isinstance(chunk_index, tuple) and len(chunk_index) > 1) else None,
+                        "subchapter": subchapter_title,
                         "source": chunk_pdf_path,
                         "type": "note",
                         "note_index": note_idx + 1
@@ -292,10 +322,13 @@ class PDFPipeline:
                 }
                 self._write_single_line(json.dumps(entry, ensure_ascii=False), output_file)
         except Exception as e:
+            # Log the error with as much context as possible *including the raw response*
+            logging.error(f"Error processing chunk {chunk_index} from {chunk_pdf_path}: {e}")
             error_entry = {
                 "instruction": "UNHANDLED PROCESSING ERROR",
                 "input": "",
-                "output": str(e),
+                "output": str(e),  # Include the full exception message
+                "raw_response": response_text[:500] if response_text else "No response",  # Include part of the raw response
                 "metadata": {
                     "source": os.path.basename(chunk_pdf_path),
                     "type": "error",
@@ -304,30 +337,40 @@ class PDFPipeline:
             }
             self._write_single_line(json.dumps(error_entry, ensure_ascii=False), output_file)
 
+        # --- Rewriting (Optional) ---
+        chapter_folder_re = os.path.join(self.config.chapters_dir, 'rewritten_jsonl')
+        os.makedirs(chapter_folder_re, exist_ok=True)
+        rewriting_output = os.path.join(chapter_folder_re, f"{safe_chapter}_rewritten.jsonl")
+
+        new_config = copy.copy(self.config)
+        run_rewrite(rewriting_output, output_file, new_config)
+
     def _fix_model_name(self) -> str:
         if self.config.model_name.startswith("models/"):
             return self.config.model_name
         else:
             return f"models/{self.config.model_name}"
-
 # --------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------
 def main():
     load_dotenv()
-    api_key = os.getenv("api_key")
-    parser = argparse.ArgumentParser(description="Split a PDF using its TOC, process via LLM, and save JSONL results into chapter-specific folders.")
+    api_key = os.getenv("api_key")  # Correctly load from .env
+    parser = argparse.ArgumentParser(description="Split PDF, extract Q&A, and save as JSONL.")
     parser.add_argument("pdf_file", help="Path to the input PDF.")
     parser.add_argument("-api-key", default=api_key, help="Gemini API key (or set GEMINI_API_KEY env var).")
-    parser.add_argument("--model-name", default="gemini-2.0-flash-thinking-exp-01-21", help="Gemini model name.")
-    parser.add_argument("--output-file", default="pdf_chunks_output.jsonl", help="(Not used for JSON output now.)")
-    parser.add_argument("--max-bytes-per-chunk", type=int, default=10_000, help="Approx. max number of bytes per PDF chunk.")
-    parser.add_argument("--page-overlap", type=int, default=1, help="How many pages of overlap between consecutive chunks.")
-    parser.add_argument("--max-retries", type=int, default=3, help="Number of times to retry the LLM call if it fails.")
+    parser.add_argument("--model-name", default="gemini-1.5-pro-002", help="Gemini model name.")
+    parser.add_argument("--output-file", default="pdf_chunks_output.jsonl", help="(Not used for direct output)")
+    parser.add_argument("--max-retries", type=int, default=3, help="Number of retries for LLM calls.")
     args = parser.parse_args()
-    
+
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-    config = Config(args)
+
+    try:
+        config = Config(args)
+    except ValueError as e:
+        logging.error(e)
+        return
 
     if not os.path.isfile(args.pdf_file):
         logging.error(f"PDF file not found: {args.pdf_file}")
