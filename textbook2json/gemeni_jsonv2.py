@@ -11,11 +11,11 @@ import fitz  # PyMuPDF
 from concurrent.futures import ThreadPoolExecutor
 from json_repair import repair_json
 from dotenv import load_dotenv
-
 from google import genai
 from google.genai import types
 from PyPDF2 import PdfReader, PdfWriter
-
+import copy
+from rewrite import Config as RewriteConfig, run_rewrite
 # --------------------------------------------------------------------
 # Helper Function
 # --------------------------------------------------------------------
@@ -156,48 +156,48 @@ def split_pdf_by_chapter(pdf_path: str, config) -> list:
     return results
 
 # --------------------------------------------------------------------
-# Pipeline 
+# Pipeline
 # --------------------------------------------------------------------
+
 class PDFPipeline:
     def __init__(self, config: Config):
         self.config = config
-        genai.Client(api_key=self.config.api_key)
         if os.path.exists(self.config.output_file):
             os.remove(self.config.output_file)
+        # Correctly initialize the client:
         self.client = genai.Client(api_key=self.config.api_key)
 
-    def clean_response(self, response_text: str):
-        invalid_ctrl_pattern = r'[\x00-\x08\x0B\x0C\x0E-\x1F]'
-        cleaned_text = re.sub(invalid_ctrl_pattern, '', response_text)
-        return cleaned_text
-    
+
     def _write_single_line(self, content: str, output_file: str):
-        """Atomic write for individual JSON lines into the given output_file."""
+        """Atomic write for individual JSON lines."""
         with open(output_file, "a", encoding="utf-8") as f:
             f.write(content + "\n")
-    
+
+
     def process_pdf(self, pdf_path: str):
-        chapters = split_pdf_by_chapter(pdf_path, self.config)
-        logging.info(f"Total {len(chapters)} chapter/subchapter PDF(s) created in '{self.config.chapters_dir}' directory.")
-    
-        for i in range(0, len(chapters), 4):
-            pair = chapters[i:i+4]
-            with ThreadPoolExecutor(max_workers=4) as executor:
-                futures = {
-                    executor.submit(self._call_llm, chapter_pdf_path, chapter_index): (chapter_index, chapter_pdf_path)
-                    for chapter_index, chapter_pdf_path in pair
-                }
-                for future in futures:
-                    chunk_index, chunk_pdf_path = futures[future]
-                    try:
-                        response_text = future.result()
-                        self._write_jsonl_record(chunk_index, chunk_pdf_path, response_text)
-                    except Exception as e:
-                        logging.error(f"Error processing chapter {chunk_index}: {e}")
-    
-    def _call_llm(self, chapter_pdf_path: str, chunk_index: int) -> str:
+            chapters = split_pdf_by_chapter(pdf_path, self.config)
+            logging.info(f"Total {len(chapters)} chapter/subchapter PDF(s) created.")
+
+            for i in range(0, len(chapters), 4):  # Process in batches of 4
+                batch = chapters[i:i+4]
+                with ThreadPoolExecutor(max_workers=4) as executor:
+                    futures = {
+                        executor.submit(self._call_llm, chapter_pdf_path, chapter_index): (chapter_index, chapter_pdf_path)
+                        for chapter_index, chapter_pdf_path in batch
+                    }
+                    for future in futures:
+                        chapter_index, chapter_pdf_path = futures[future]
+                        try:
+                            response_text = future.result()
+                            self._write_jsonl_record(chapter_index, chapter_pdf_path, response_text)
+                        except Exception as e:
+                            logging.error(f"Error processing {chapter_index}: {e}")
+
+
+    def _call_llm(self, chapter_pdf_path: str, chapter_index: tuple) -> str:
         with open(chapter_pdf_path, "rb") as f:
             chapter_bytes = f.read()
+
         attempt = 0
         while attempt < self.config.max_retries:
             attempt += 1
@@ -207,98 +207,138 @@ class PDFPipeline:
                     model=self._fix_model_name(),
                     contents=[chapter_part, self.config.prompt]
                 )
-                if response.text is None:
+                if response.text is None:  # Check if .text is None
                     raise Exception("LLM response.text is None.")
-                candidates = response.usage_metadata.candidates_token_count or 0
-                total = response.usage_metadata.total_token_count or 0
-                real_tokens = candidates + total
-                logging.info(f"Chapter {chunk_index}: {real_tokens} tokens")
+
+                # Log token usage (important for cost tracking)
+                tokens_used = (response.candidates[0].token_count if response.candidates else 0)
+                logging.info(f"Chapter {chapter_index}: {tokens_used} tokens used")
                 return response.text
+
             except Exception as e:
-                logging.warning(f"LLM call failed for chapter {chunk_index}, attempt {attempt}/{self.config.max_retries}: {e}")
-                time.sleep(2 ** attempt)
-        logging.error(f"Giving up on chapter {chunk_index} after {self.config.max_retries} retries.")
-        return ""
-    
+                logging.warning(f"LLM call failed for {chapter_index}, attempt {attempt}/{self.config.max_retries}: {e}")
+                time.sleep(2 ** attempt)  # Exponential backoff
+
+        logging.error(f"Giving up on {chapter_index} after {self.config.max_retries} retries.")
+        return ""  # Return empty string on failure
+
+
     def parse_json(self, response_text: str) -> dict:
+        """
+        Parses the LLM response text, attempting to extract a valid JSON object.
+        Handles various common issues, including extra text, invalid characters,
+        and incorrect delimiters.  Returns a dictionary on success, or raises
+        a *detailed* exception on failure.
+        """
         if response_text is None:
             raise ValueError("Response text is None.")
-        
+
+        # 1. Remove common LLM prefixes/suffixes (like ```json ... ```)
         cleaned = response_text.replace('```json', '').replace('```', '').strip()
-        cleaned = re.sub(r'[\x00-\x08\x0B-\x0C\x0E-\x1F]', '', cleaned)
+
+        # 2. Remove invalid control characters.
+        cleaned = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F]', '', cleaned)
+
+        # 3. Try to find the *first* '{' and the *last* '}' to handle extra text.
         json_start = cleaned.find('{')
-        json_end = cleaned.rfind('}') + 1
-        if json_start != -1 and json_end != 0:
-            cleaned = cleaned[json_start:json_end]
-        cleaned = re.sub(r'}\s*{', r'},{', cleaned)
-        cleaned = re.sub(r',(\s*[}\]])', r'\1', cleaned)
-        repaired = repair_json(cleaned)
+        json_end = cleaned.rfind('}') + 1  # +1 to *include* the last '}'
+
+        if json_start == -1 or json_end == 0:
+            raise ValueError(f"No valid JSON object found in response.  First 200 chars: {cleaned[:200]}")
+        cleaned = cleaned[json_start:json_end]
+
+        # 4. Try to fix common JSON errors (like missing commas between objects).
+        cleaned = re.sub(r'}\s*{', r'},{', cleaned)  # Add commas between adjacent objects
+        cleaned = re.sub(r',(\s*[}\]])', r'\1', cleaned) # Remove trailing commas
+
+        # 5. Use json_repair to handle more complex errors.
+        try:
+            repaired = repair_json(cleaned)
+        except Exception as e:
+            raise ValueError(f"json_repair failed: {e}.  Original (cleaned) text (first 200 chars): {cleaned[:200]}")
+
+        # 6. Attempt to parse as JSON.
         try:
             return json.loads(repaired)
-        except Exception as e:
-            raise Exception(f"Failed to parse JSON after repair: {e}\nRepaired JSON (first 300 chars): {repaired[:300]}")
-    
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Failed to parse JSON after repair: {e}\nRepaired JSON (first 300 chars): {repaired[:300]}\nOriginal (cleaned) text (first 300 chars): {cleaned[:300]}")
+
     def _write_jsonl_record(self, chunk_index: tuple, chunk_pdf_path: str, response_text: str):
-        """
-        Writes JSON lines into a chapter-specific folder.
-        `chunk_index` is a tuple: (chapter_title, subchapter_title)
-        """
         chapter_title, subchapter_title = chunk_index
         safe_chapter = sanitize_filename(chapter_title.replace(" ", "_"))
-        chapter_folder = os.path.join(self.config.chapters_dir, safe_chapter)
+
+        chapter_folder = os.path.join(self.config.chapters_dir, 'jsonl')
         os.makedirs(chapter_folder, exist_ok=True)
         
         if subchapter_title:
             safe_sub = sanitize_filename(subchapter_title.replace(" ", "_"))
-            output_file = os.path.join(chapter_folder, f"{safe_sub}.jsonl")
+            filename = f"{safe_chapter}_{safe_sub}.jsonl"
         else:
-            output_file = os.path.join(chapter_folder, f"{safe_chapter}.jsonl")
+            filename = f"{safe_chapter}.jsonl"
+        
+        output_file = os.path.join(chapter_folder, filename)
         
         try:
-            response_data = self.parse_json(response_text)
-            
+            response_data = self.parse_json(response_text) #parse the json
+
+            # Handle a list of JSON objects
             if isinstance(response_data, list):
                 combined = {"qa_pairs": [], "instructional_notes": []}
-                for item in response_data:
+                for item in response_data: #combine each dict
                     if isinstance(item, dict):
-                        if "qa_pairs" in item and isinstance(item["qa_pairs"], list):
-                            combined["qa_pairs"].extend(item["qa_pairs"])
-                        if "instructional_notes" in item and isinstance(item["instructional_notes"], list):
-                            combined["instructional_notes"].extend(item["instructional_notes"])
-                response_data = combined
+                        combined["qa_pairs"].extend(item.get("qa_pairs", []))
+                        combined["instructional_notes"].extend(item.get("instructional_notes", []))
+                response_data = combined  # Use the combined dictionary
+
+            # Check if response is dict with expected structure
+            if not isinstance(response_data, dict) or not all(k in response_data for k in ["qa_pairs", "instructional_notes"]):
+                raise ValueError(f"Parsed JSON is not a dictionary or missing keys: {response_data.keys() if isinstance(response_data, dict) else 'Not a dict'}")
             
-            if not isinstance(response_data, dict):
-                raise Exception("Parsed JSON is not a dictionary.")
-    
-            source_name = os.path.splitext(os.path.basename(chunk_pdf_path))[0]
-            source = f"{self.config.chapters_dir}/{source_name}"
-            base_metadata = {"chapter": chapter_title, "subchapter": subchapter_title, "source": source}
-    
+            # Write QA pairs.
             for qa in response_data.get("qa_pairs", []):
-                if not isinstance(qa, dict):
+                if not isinstance(qa, dict) or "question" not in qa or "answer" not in qa:
+                    logging.warning(f"Skipping invalid QA pair: {qa}")
                     continue
+
                 entry = {
                     "instruction": qa.get("question", "").strip(),
                     "input": "",
                     "output": qa.get("answer", "").strip(),
-                    "metadata": {**base_metadata, "type": "qa"}
+                    "metadata": {
+                        "chapter": chapter_title,
+                        "subchapter": subchapter_title,
+                        "source": chunk_pdf_path,
+                        "type": "qa"
+                    }
                 }
                 self._write_single_line(json.dumps(entry, ensure_ascii=False), output_file)
-    
+            
+            # Write instructional notes.
             for note_idx, note in enumerate(response_data.get("instructional_notes", [])):
+                if not isinstance(note, str):
+                    logging.warning(f"Skipping invalid instructional note (not a string): {note}")
+                    continue
                 entry = {
                     "instruction": note.strip(),
                     "input": "",
-                    "output": "",
-                    "metadata": {**base_metadata, "type": "note", "note_index": note_idx + 1}
+                    "output": "",  # No output for notes
+                    "metadata": {
+                        "chapter": chapter_title,
+                        "subchapter": subchapter_title,
+                        "source": chunk_pdf_path,
+                        "type": "note",
+                        "note_index": note_idx + 1
+                    }
                 }
                 self._write_single_line(json.dumps(entry, ensure_ascii=False), output_file)
-    
         except Exception as e:
+            # Log the error with as much context as possible *including the raw response*
+            logging.error(f"Error processing chunk {chunk_index} from {chunk_pdf_path}: {e}")
             error_entry = {
                 "instruction": "UNHANDLED PROCESSING ERROR",
                 "input": "",
-                "output": str(e),
+                "output": str(e),  # Include the full exception message
+                "raw_response": response_text[:500] if response_text else "No response",  # Include part of the raw response
                 "metadata": {
                     "source": os.path.basename(chunk_pdf_path),
                     "type": "error",
@@ -306,37 +346,46 @@ class PDFPipeline:
                 }
             }
             self._write_single_line(json.dumps(error_entry, ensure_ascii=False), output_file)
-    
+
+        # --- Rewriting (Optional) ---
+        chapter_folder_re = os.path.join(self.config.chapters_dir, 'rewritten_jsonl')
+        os.makedirs(chapter_folder_re, exist_ok=True)
+        rewriting_output = os.path.join(chapter_folder_re, f"{safe_chapter}_rewritten.jsonl")
+
+        new_config = copy.copy(self.config)
+        run_rewrite(rewriting_output, output_file, new_config)
+
     def _fix_model_name(self) -> str:
         if self.config.model_name.startswith("models/"):
             return self.config.model_name
         else:
             return f"models/{self.config.model_name}"
-
 # --------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------
 def main():
     load_dotenv()
-    api_key = os.getenv("api_key")
-    parser = argparse.ArgumentParser(description="Split a PDF with overlap, track tokens, and produce JSONL chunk results stored in chapter-specific folders.")
+    api_key = os.getenv("api_key")  # Correctly load from .env
+    parser = argparse.ArgumentParser(description="Split PDF, extract Q&A, and save as JSONL.")
     parser.add_argument("pdf_file", help="Path to the input PDF.")
     parser.add_argument("-api-key", default=api_key, help="Gemini API key (or set GEMINI_API_KEY env var).")
     parser.add_argument("--model-name", default="gemini-2.0-flash-thinking-exp-01-21", help="Gemini model name.")
-    parser.add_argument("--output-file", default="pdf_chunks_output.jsonl", help="JSONL file to store chunk results.")
-    parser.add_argument("--max-bytes-per-chunk", type=int, default=10_000, help="Approx. max number of bytes per PDF chunk.")
-    parser.add_argument("--page-overlap", type=int, default=1, help="How many pages of overlap between consecutive chunks.")
-    parser.add_argument("--max-retries", type=int, default=3, help="Number of times to retry the LLM call if it fails.")
+    parser.add_argument("--output-file", default="pdf_chunks_output.jsonl", help="(Not used for direct output)")
+    parser.add_argument("--max-retries", type=int, default=3, help="Number of retries for LLM calls.")
     args = parser.parse_args()
-    
+
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-    
-    config = Config(args)
-    
+
+    try:
+        config = Config(args)
+    except ValueError as e:
+        logging.error(e)
+        return
+
     if not os.path.isfile(args.pdf_file):
         logging.error(f"PDF file not found: {args.pdf_file}")
         return
-    
+
     pipeline = PDFPipeline(config)
     pipeline.process_pdf(args.pdf_file)
 

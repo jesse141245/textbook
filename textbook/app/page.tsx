@@ -1,6 +1,7 @@
 "use client";
 import { useState } from "react";
 import { motion } from "framer-motion";
+import { useRouter } from "next/navigation";
 
 const subjects = [
   { name: "Physics", learners: "10M learners", icon: "🔬" },
@@ -14,8 +15,8 @@ const subjects = [
   { name: "Economics", learners: "6M learners", icon: "💰" },
 ];
 
-
 export default function StudyApp() {
+  const router = useRouter();
   const [selectedSubject, setSelectedSubject] = useState<string | null>(null);
   const [textbook, setTextbook] = useState("");
 
@@ -34,7 +35,54 @@ export default function StudyApp() {
           className="p-4 border rounded-md w-[32rem] text-center mb-6 text-2xl"
         />
         <button
-          onClick={() => alert(`Loading ${selectedSubject} textbook: ${textbook}`)}
+          onClick={() => { // Removed async here, as we don't await fetch for navigation
+            try {
+              const formData = new FormData();
+              // Ensure this script name matches what your API expects
+              formData.append("scriptName", "your_python_script.py");
+              // Send the textbook info
+              formData.append("pdfFileName", textbook); // Or use a different key if your API expects it
+
+              // --- Initiate the fetch request ---
+              const fetchPromise = fetch("/api/runPython", {
+                method: "POST",
+                body: formData,
+              });
+
+              // --- Navigate immediately ---
+              router.push("/welcome");
+
+              // --- Optional: Handle the promise result later (for logging) ---
+              fetchPromise.then(async (res) => {
+                  if (res.ok) {
+                    // The server acknowledged the request start.
+                    // Note: This doesn't mean the Python script finished,
+                    // only that the API endpoint received the request and *likely* started the script.
+                    console.log("Python script execution initiated successfully.");
+                    // You could potentially try to read the response if your API sends one back immediately
+                    // const data = await res.json();
+                    // console.log("API immediate response:", data);
+                  } else {
+                    // The API endpoint itself had an error *before* or *during* initiating the script
+                    const errorText = await res.text();
+                    console.error(`Error response from /api/runPython (${res.status}): ${errorText}`);
+                    // Cannot easily alert the user here as they've navigated away.
+                    // Consider a more robust notification system if feedback is critical.
+                  }
+                })
+                .catch((err) => {
+                  // Catch network errors or issues *during* the fetch itself (after navigation)
+                  console.error("Error during fetch call to /api/runPython (after navigation):", err);
+                   // Cannot easily alert the user here.
+                });
+
+            } catch (err) {
+              // Catch errors *only* during FormData creation or the synchronous setup of fetch
+              console.error("Error setting up API call:", err);
+              alert("Failed to initiate the process. Please check your input or network connection.");
+              // Don't navigate if we couldn't even start the request
+            }
+          }}
           className="px-6 py-4 bg-blue-500 text-white text-2xl rounded-md hover:bg-blue-600"
         >
           Submit
@@ -53,7 +101,6 @@ export default function StudyApp() {
   for (let r = 0; r < rows; r++) {
     gridItems.push(...subjects.slice(used, used + 4));
     used += 4;
-    
   }
 
   return (
@@ -61,12 +108,9 @@ export default function StudyApp() {
       <h1 className="text-5xl font-bold text-center mb-10">
         I want to learn...
       </h1>
-
-      {/* 4 columns, auto rows. place-items-center to center items in each cell */}
       <div className="grid grid-cols-4 gap-4 place-items-center">
         {gridItems.map((item, index) => {
           if (!item) {
-            // Placeholder: invisible cell to keep layout consistent
             return <div key={index} className="w-48 h-48" />;
           }
           return (
